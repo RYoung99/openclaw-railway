@@ -49,15 +49,15 @@ This lets you use a ChatGPT/Codex account or an eligible SuperGrok / X Premium s
 ## Local testing
 
 ```bash
-docker build -t openclaw-railway-template .
+docker build -t openclaw-railway .
 
 docker run --rm -p 8080:8080 \
   -e PORT=8080 \
   -e SETUP_PASSWORD=test \
   -e OPENCLAW_STATE_DIR=/data/.openclaw \
-  -e OPENCLAW_WORKSPACE_DIR=/data/workspace \
+  -e OPENCLAW_WORKSPACE_DIR=/data/.openclaw/workspace \
   -v $(pwd)/.tmpdata:/data \
-  openclaw-railway-template
+  openclaw-railway
 
 # Setup wizard: http://localhost:8080/setup (password: test)
 ```
