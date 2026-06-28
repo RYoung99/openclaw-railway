@@ -29,16 +29,16 @@ npm run lint
 
 ```bash
 # Build the container
-docker build -t openclaw-railway-template .
+docker build -t openclaw-railway .
 
 # Run locally with volume
 docker run --rm -p 8080:8080 \
   -e PORT=8080 \
   -e SETUP_PASSWORD=test \
   -e OPENCLAW_STATE_DIR=/data/.openclaw \
-  -e OPENCLAW_WORKSPACE_DIR=/data/workspace \
+  -e OPENCLAW_WORKSPACE_DIR=/data/.openclaw/workspace \
   -v $(pwd)/.tmpdata:/data \
-  openclaw-railway-template
+  openclaw-railway
 
 # Access setup wizard
 open http://localhost:8080/setup  # password: test
@@ -83,7 +83,7 @@ open http://localhost:8080/setup  # password: test
 
 **Recommended (Railway template defaults):**
 - `OPENCLAW_STATE_DIR=/data/.openclaw` — config + credentials
-- `OPENCLAW_WORKSPACE_DIR=/data/workspace` — agent workspace
+- `OPENCLAW_WORKSPACE_DIR=/data/.openclaw/workspace` — agent workspace
 
 **Optional:**
 - `OPENCLAW_GATEWAY_TOKEN` — auth token for gateway (auto-generated if unset)
