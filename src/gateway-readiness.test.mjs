@@ -4,7 +4,20 @@ import test from "node:test";
 import {
   canServeGatewayRequest,
   describeGatewayHealth,
+  isGatewayStartupReady,
 } from "./gateway-readiness.js";
+
+test("accepts successful startup probe responses", () => {
+  assert.equal(isGatewayStartupReady(200), true);
+  assert.equal(isGatewayStartupReady(204), true);
+});
+
+test("rejects redirects, auth errors, missing routes, and server errors", () => {
+  assert.equal(isGatewayStartupReady(302), false);
+  assert.equal(isGatewayStartupReady(401), false);
+  assert.equal(isGatewayStartupReady(404), false);
+  assert.equal(isGatewayStartupReady(503), false);
+});
 
 test("serves gateway requests when a detached gateway is reachable", () => {
   assert.equal(
