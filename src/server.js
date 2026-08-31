@@ -13,6 +13,7 @@ import {
   describeGatewayHealth,
   isGatewayStartupReady,
 } from "./gateway-readiness.js";
+import { rebuildForwardedHeaders } from "./proxy-headers.js";
 
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
 const STATE_DIR =
@@ -257,6 +258,39 @@ async function syncAllowedOrigins() {
   }
 }
 
+async function syncTrustedProxies() {
+  const expected = ["127.0.0.1", "::1"];
+  const current = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs(["config", "get", "gateway.trustedProxies"]),
+  );
+
+  try {
+    if (
+      current.code === 0 &&
+      JSON.stringify(JSON.parse(stripAnsi(current.output).trim())) ===
+        JSON.stringify(expected)
+    ) {
+      return;
+    }
+  } catch {}
+
+  const result = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs([
+      "config",
+      "set",
+      "--json",
+      "gateway.trustedProxies",
+      JSON.stringify(expected),
+    ]),
+  );
+  if (result.code !== 0) {
+    throw new Error(`Failed to set gateway.trustedProxies (exit=${result.code})`);
+  }
+  log.info("gateway", `set trustedProxies to ${JSON.stringify(expected)}`);
+}
+
 let gatewayProc = null;
 let gatewayStarting = null;
 let shuttingDown = false;
@@ -456,6 +490,7 @@ async function ensureGatewayRunning() {
   }
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
+      await syncTrustedProxies();
       await syncAllowedOrigins();
       await startGateway();
       const ready = await waitForGatewayReady({ timeoutMs: 60_000 });
@@ -1140,18 +1175,6 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       );
       stream(`[config] gateway.auth.token exit=${tokenResult.code}\n`);
 
-      const proxiesResult = await runCmd(
-        OPENCLAW_NODE,
-        clawArgs([
-          "config",
-          "set",
-          "--json",
-          "gateway.trustedProxies",
-          '["127.0.0.1"]',
-        ]),
-      );
-      stream(`[config] gateway.trustedProxies exit=${proxiesResult.code}\n`);
-
       if (payload.model?.trim()) {
         stream(`[setup] Setting model to ${payload.model.trim()}...\n`);
         const modelResult = await runCmd(
@@ -1717,7 +1740,6 @@ app.get("/setup/api/logs/stream", requireSetupAuth, (req, res) => {
 const proxy = httpProxy.createProxyServer({
   target: GATEWAY_TARGET,
   ws: true,
-  xfwd: true,
   changeOrigin: true,
   proxyTimeout: 120_000,
   timeout: 120_000,
@@ -1748,11 +1770,21 @@ proxy.on("proxyReq", (proxyReq, req, res) => {
     proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
   }
   proxyReq.setHeader("Origin", PROXY_ORIGIN);
+  rebuildForwardedHeaders(
+    proxyReq,
+    req,
+    process.env.RAILWAY_PUBLIC_DOMAIN,
+  );
 });
 
 proxy.on("proxyReqWs", (proxyReq, req, socket, options, head) => {
   proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
   proxyReq.setHeader("Origin", PROXY_ORIGIN);
+  rebuildForwardedHeaders(
+    proxyReq,
+    req,
+    process.env.RAILWAY_PUBLIC_DOMAIN,
+  );
 });
 
 app.use(async (req, res) => {
