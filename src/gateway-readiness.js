@@ -3,6 +3,10 @@ export function canServeGatewayRequest({ configured, reachable }) {
   return reachable;
 }
 
+export function isGatewayStartupReady(status) {
+  return status >= 200 && status < 300;
+}
+
 export function describeGatewayHealth({
   configured,
   hasProcessHandle,

@@ -57,9 +57,8 @@
 
       get authRequiresSecret() {
         return ![
-          'openai-codex-device-code',
+          'openai-device-code',
           'xai-device-code',
-          'google-gemini-cli',
           'github-copilot',
           'ollama',
           'vllm',
@@ -69,7 +68,7 @@
 
       get isDeviceCode() {
         return [
-          'openai-codex-device-code',
+          'openai-device-code',
           'xai-device-code'
         ].includes(this.selectedAuth);
       },
