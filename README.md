@@ -96,7 +96,7 @@ A: Visit `/setup` on your deployed instance at any time — it works both before
 
 **Q: My config seems broken or I'm getting strange errors. How do I fix it?**
 
-A: Go to `/setup` and click the "Run Doctor" button. This runs `openclaw doctor --repair` which performs health checks on your gateway and channels, creates a backup of your config, and removes any unrecognized or corrupted configuration keys.
+A: Go to `/setup` and click the "Run Doctor" button. This runs `openclaw doctor --fix` which performs health checks on your gateway and channels, creates a backup of your config, and removes any unrecognized or corrupted configuration keys.
 
 ## Screenshots
 

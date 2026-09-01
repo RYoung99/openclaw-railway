@@ -11,7 +11,9 @@ import httpProxy from "http-proxy";
 import {
   canServeGatewayRequest,
   describeGatewayHealth,
+  isGatewayStartupReady,
 } from "./gateway-readiness.js";
+import { rebuildForwardedHeaders } from "./proxy-headers.js";
 
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
 const STATE_DIR =
@@ -96,6 +98,7 @@ function resolveGatewayToken() {
 
 const OPENCLAW_GATEWAY_TOKEN = resolveGatewayToken();
 process.env.OPENCLAW_GATEWAY_TOKEN = OPENCLAW_GATEWAY_TOKEN;
+process.env.OPENCLAW_SUPERVISOR_MODE = "external";
 
 let cachedOpenclawVersion = null;
 
@@ -255,6 +258,39 @@ async function syncAllowedOrigins() {
   }
 }
 
+async function syncTrustedProxies() {
+  const expected = ["127.0.0.1", "::1"];
+  const current = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs(["config", "get", "gateway.trustedProxies"]),
+  );
+
+  try {
+    if (
+      current.code === 0 &&
+      JSON.stringify(JSON.parse(stripAnsi(current.output).trim())) ===
+        JSON.stringify(expected)
+    ) {
+      return;
+    }
+  } catch {}
+
+  const result = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs([
+      "config",
+      "set",
+      "--json",
+      "gateway.trustedProxies",
+      JSON.stringify(expected),
+    ]),
+  );
+  if (result.code !== 0) {
+    throw new Error(`Failed to set gateway.trustedProxies (exit=${result.code})`);
+  }
+  log.info("gateway", `set trustedProxies to ${JSON.stringify(expected)}`);
+}
+
 let gatewayProc = null;
 let gatewayStarting = null;
 let shuttingDown = false;
@@ -266,35 +302,76 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function probeGatewayOnce(opts = {}) {
-  const endpoints = ["/openclaw", "/", "/health"];
-  const timeoutMs = opts.timeoutMs ?? 2000;
+function hasChildExited(proc) {
+  return proc.exitCode !== null || proc.signalCode !== null;
+}
 
-  for (const endpoint of endpoints) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const res = await fetch(`${GATEWAY_TARGET}${endpoint}`, {
-        method: "GET",
-        signal: controller.signal,
-      });
-      if (res.status < 500) {
-        return { ok: true, endpoint };
-      }
-    } catch (err) {
-      if (
-        err.name !== "AbortError" &&
-        err.code !== "ECONNREFUSED" &&
-        err.cause?.code !== "ECONNREFUSED"
-      ) {
-        const msg = err.code || err.message;
-        if (msg !== "fetch failed" && msg !== "UND_ERR_CONNECT_TIMEOUT") {
-          log.warn("gateway", `health check error: ${msg}`);
+function waitForChildExit(proc, timeoutMs) {
+  if (hasChildExited(proc)) return Promise.resolve(true);
+
+  return new Promise((resolve) => {
+    const onExit = () => {
+      clearTimeout(timeout);
+      resolve(true);
+    };
+    const timeout = setTimeout(() => {
+      proc.off("exit", onExit);
+      resolve(false);
+    }, timeoutMs);
+    proc.once("exit", onExit);
+  });
+}
+
+async function stopGatewayProcess() {
+  const proc = gatewayProc;
+  if (!proc) return;
+
+  intentionalRestart = true;
+  try {
+    if (!hasChildExited(proc)) {
+      proc.kill("SIGTERM");
+      if (!(await waitForChildExit(proc, 2000))) {
+        log.warn("gateway", "did not stop after SIGTERM; sending SIGKILL");
+        proc.kill("SIGKILL");
+        if (!(await waitForChildExit(proc, 2000))) {
+          throw new Error("Gateway did not stop after SIGKILL");
         }
       }
-    } finally {
-      clearTimeout(timeout);
     }
+  } finally {
+    if (gatewayProc === proc && hasChildExited(proc)) gatewayProc = null;
+    intentionalRestart = false;
+  }
+}
+
+async function probeGatewayOnce(opts = {}) {
+  const endpoint = "/startupz";
+  const timeoutMs = opts.timeoutMs ?? 2000;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${GATEWAY_TARGET}${endpoint}`, {
+      method: "GET",
+      redirect: "manual",
+      signal: controller.signal,
+    });
+    if (isGatewayStartupReady(res.status)) {
+      return { ok: true, endpoint };
+    }
+  } catch (err) {
+    if (
+      err.name !== "AbortError" &&
+      err.code !== "ECONNREFUSED" &&
+      err.cause?.code !== "ECONNREFUSED"
+    ) {
+      const msg = err.code || err.message;
+      if (msg !== "fetch failed" && msg !== "UND_ERR_CONNECT_TIMEOUT") {
+        log.warn("gateway", `startup check error: ${msg}`);
+      }
+    }
+  } finally {
+    clearTimeout(timeout);
   }
 
   return { ok: false, endpoint: null };
@@ -323,9 +400,6 @@ async function startGateway() {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
 
-  const stopResult = await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
-  log.info("gateway", `stop existing gateway exit=${stopResult.code}`);
-
   const args = [
     "gateway",
     "run",
@@ -343,7 +417,7 @@ async function startGateway() {
   ];
 
   gatewayLastStartTime = Date.now();
-  gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
+  const proc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
     stdio: "inherit",
     env: {
       ...process.env,
@@ -351,6 +425,7 @@ async function startGateway() {
       OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
     },
   });
+  gatewayProc = proc;
 
   const safeArgs = args.map((arg, i) =>
     args[i - 1] === "--token" ? "[REDACTED]" : arg
@@ -360,16 +435,22 @@ async function startGateway() {
   log.info("gateway", `WORKSPACE_DIR: ${WORKSPACE_DIR}`);
   log.info("gateway", `config path: ${configPath()}`);
 
-  gatewayProc.on("error", (err) => {
+  proc.on("error", (err) => {
     log.error("gateway", `spawn error: ${String(err)}`);
-    gatewayProc = null;
+    if (gatewayProc === proc) gatewayProc = null;
   });
 
-  gatewayProc.on("exit", (code, signal) => {
+  proc.on("exit", (code, signal) => {
     log.error("gateway", `exited code=${code} signal=${signal}`);
     const uptime = Date.now() - gatewayLastStartTime;
-    gatewayProc = null;
-    if (!shuttingDown && !intentionalRestart && isConfigured()) {
+    const wasCurrentProcess = gatewayProc === proc;
+    if (wasCurrentProcess) gatewayProc = null;
+    if (
+      wasCurrentProcess &&
+      !shuttingDown &&
+      !intentionalRestart &&
+      isConfigured()
+    ) {
       if (uptime > 30_000) {
         gatewayRestartCount = 0;
       } else {
@@ -409,6 +490,7 @@ async function ensureGatewayRunning() {
   }
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
+      await syncTrustedProxies();
       await syncAllowedOrigins();
       await startGateway();
       const ready = await waitForGatewayReady({ timeoutMs: 60_000 });
@@ -432,18 +514,7 @@ function isGatewayReady() {
 }
 
 async function restartGateway() {
-  if (gatewayProc) {
-    intentionalRestart = true;
-    try {
-      gatewayProc.kill("SIGTERM");
-    } catch (err) {
-      log.warn("gateway", `kill error: ${err.message}`);
-    }
-    await sleep(750);
-    gatewayProc = null;
-    intentionalRestart = false;
-  }
-  await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
+  await stopGatewayProcess();
   gatewayRestartCount = 0;
   return ensureGatewayRunning();
 }
@@ -623,8 +694,8 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
       options: [
         { value: "openai-api-key", label: "OpenAI API key" },
         {
-          value: "openai-codex-device-code",
-          label: "OpenAI Codex device pairing",
+          value: "openai-device-code",
+          label: "ChatGPT device pairing",
           hint: "ChatGPT login without an API key",
         },
       ],
@@ -632,10 +703,9 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
     {
       value: "google",
       label: "Google",
-      hint: "API key / CLI",
+      hint: "API key",
       options: [
         { value: "gemini-api-key", label: "Google Gemini API key" },
-        { value: "google-gemini-cli", label: "Google Gemini CLI (OAuth)" },
       ],
     },
     {
@@ -730,19 +800,13 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
     },
     {
       value: "qwen",
-      label: "Qwen",
-      hint: "OAuth",
-      options: [{ value: "qwen-portal", label: "Qwen OAuth" }],
-    },
-    {
-      value: "modelstudio",
-      label: "Alibaba Model Studio",
-      hint: "Qwen via Alibaba Cloud",
+      label: "Qwen Cloud",
+      hint: "Standard / Coding Plan",
       options: [
-        { value: "modelstudio-api-key", label: "Coding Plan (Global)" },
-        { value: "modelstudio-api-key-cn", label: "Coding Plan (CN)" },
-        { value: "modelstudio-standard-api-key", label: "Standard Plan (Global)" },
-        { value: "modelstudio-standard-api-key-cn", label: "Standard Plan (CN)" },
+        { value: "qwen-api-key", label: "Coding Plan (Global)" },
+        { value: "qwen-api-key-cn", label: "Coding Plan (CN)" },
+        { value: "qwen-standard-api-key", label: "Standard Plan (Global)" },
+        { value: "qwen-standard-api-key-cn", label: "Standard Plan (CN)" },
       ],
     },
     {
@@ -857,6 +921,8 @@ function buildOnboardArgs(payload) {
   const args = [
     "onboard",
     "--accept-risk",
+    "--mode",
+    "local",
     "--no-install-daemon",
     "--skip-health",
     "--workspace",
@@ -895,10 +961,10 @@ function buildOnboardArgs(payload) {
       "minimax-global-api": "--minimax-api-key",
       "minimax-cn-api": "--minimax-api-key",
       "zai-api-key": "--zai-api-key",
-      "modelstudio-api-key": "--modelstudio-api-key",
-      "modelstudio-api-key-cn": "--modelstudio-api-key-cn",
-      "modelstudio-standard-api-key": "--modelstudio-standard-api-key",
-      "modelstudio-standard-api-key-cn": "--modelstudio-standard-api-key-cn",
+      "qwen-api-key": "--modelstudio-api-key",
+      "qwen-api-key-cn": "--modelstudio-api-key-cn",
+      "qwen-standard-api-key": "--modelstudio-standard-api-key",
+      "qwen-standard-api-key-cn": "--modelstudio-standard-api-key-cn",
       "venice-api-key": "--venice-api-key",
       "chutes-api-key": "--chutes-api-key",
       "kilocode-api-key": "--kilocode-api-key",
@@ -974,10 +1040,8 @@ function runCmd(cmd, args, opts = {}) {
 const VALID_AUTH_CHOICES = [
   "apiKey",
   "openai-api-key",
-  "openai-codex",
-  "openai-codex-device-code",
+  "openai-device-code",
   "gemini-api-key",
-  "google-gemini-cli",
   "deepseek-api-key",
   "openrouter-api-key",
   "xai-api-key",
@@ -999,11 +1063,10 @@ const VALID_AUTH_CHOICES = [
   "zai-coding-cn",
   "zai-global",
   "zai-cn",
-  "qwen-portal",
-  "modelstudio-api-key",
-  "modelstudio-api-key-cn",
-  "modelstudio-standard-api-key",
-  "modelstudio-standard-api-key-cn",
+  "qwen-api-key",
+  "qwen-api-key-cn",
+  "qwen-standard-api-key",
+  "qwen-standard-api-key-cn",
   "venice-api-key",
   "chutes",
   "chutes-api-key",
@@ -1028,8 +1091,7 @@ const VALID_AUTH_CHOICES = [
 // can't be driven from the web wizard — direct the operator to run
 // `openclaw wizard` from the Railway console instead.
 const RAILWAY_CONSOLE_AUTH_CHOICES = [
-  "openai-codex",
-  "openai-codex-device-code",
+  "openai-device-code",
   "xai-device-code",
 ];
 
@@ -1102,19 +1164,6 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     if (ok) {
       stream("\n[setup] Configuring gateway settings...\n");
 
-      const allowInsecureResult = await runCmd(
-        OPENCLAW_NODE,
-        clawArgs([
-          "config",
-          "set",
-          "gateway.controlUi.allowInsecureAuth",
-          "true",
-        ]),
-      );
-      stream(
-        `[config] gateway.controlUi.allowInsecureAuth=true exit=${allowInsecureResult.code}\n`,
-      );
-
       const tokenResult = await runCmd(
         OPENCLAW_NODE,
         clawArgs([
@@ -1125,18 +1174,6 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
         ]),
       );
       stream(`[config] gateway.auth.token exit=${tokenResult.code}\n`);
-
-      const proxiesResult = await runCmd(
-        OPENCLAW_NODE,
-        clawArgs([
-          "config",
-          "set",
-          "--json",
-          "gateway.trustedProxies",
-          '["127.0.0.1"]',
-        ]),
-      );
-      stream(`[config] gateway.trustedProxies exit=${proxiesResult.code}\n`);
 
       if (payload.model?.trim()) {
         stream(`[setup] Setting model to ${payload.model.trim()}...\n`);
@@ -1299,14 +1336,7 @@ app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
 
 app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
   try {
-    if (gatewayProc) {
-      intentionalRestart = true;
-      gatewayProc.kill("SIGTERM");
-      await sleep(750);
-      gatewayProc = null;
-      intentionalRestart = false;
-    }
-    await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
+    await stopGatewayProcess();
     fs.rmSync(configPath(), { force: true });
     res
       .type("text/plain")
@@ -1317,7 +1347,7 @@ app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
 });
 
 app.post("/setup/api/doctor", requireSetupAuth, async (_req, res) => {
-  const args = ["doctor", "--non-interactive", "--repair"];
+  const args = ["doctor", "--non-interactive", "--fix"];
   const result = await runCmd(OPENCLAW_NODE, clawArgs(args));
   return res.status(result.code === 0 ? 200 : 500).json({
     ok: result.code === 0,
@@ -1634,18 +1664,8 @@ app.post(
 
       // Now that the archive is fully extracted and validated, take down the
       // gateway. From here through the rename swap, downtime is unavoidable.
-      if (gatewayProc) {
-        intentionalRestart = true;
-        try {
-          gatewayProc.kill("SIGTERM");
-        } catch (err) {
-          log.warn("import", `kill error: ${err.message}`);
-        }
-        await sleep(750);
-        gatewayProc = null;
-        intentionalRestart = false;
-        gatewayWasStopped = true;
-      }
+      gatewayWasStopped = gatewayProc !== null;
+      if (gatewayWasStopped) await stopGatewayProcess();
 
       for (const { target, source } of validReplacements) {
         const backup = `${target}.bak-${ts}`;
@@ -1720,7 +1740,6 @@ app.get("/setup/api/logs/stream", requireSetupAuth, (req, res) => {
 const proxy = httpProxy.createProxyServer({
   target: GATEWAY_TARGET,
   ws: true,
-  xfwd: true,
   changeOrigin: true,
   proxyTimeout: 120_000,
   timeout: 120_000,
@@ -1751,11 +1770,21 @@ proxy.on("proxyReq", (proxyReq, req, res) => {
     proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
   }
   proxyReq.setHeader("Origin", PROXY_ORIGIN);
+  rebuildForwardedHeaders(
+    proxyReq,
+    req,
+    process.env.RAILWAY_PUBLIC_DOMAIN,
+  );
 });
 
 proxy.on("proxyReqWs", (proxyReq, req, socket, options, head) => {
   proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
   proxyReq.setHeader("Origin", PROXY_ORIGIN);
+  rebuildForwardedHeaders(
+    proxyReq,
+    req,
+    process.env.RAILWAY_PUBLIC_DOMAIN,
+  );
 });
 
 app.use(async (req, res) => {
@@ -1847,26 +1876,10 @@ async function gracefulShutdown(signal) {
 
   server.close();
 
-  if (gatewayProc) {
-    try {
-      gatewayProc.kill("SIGTERM");
-      await Promise.race([
-        new Promise((resolve) => gatewayProc.on("exit", resolve)),
-        new Promise((resolve) => setTimeout(resolve, 2000)),
-      ]);
-      if (gatewayProc && !gatewayProc.killed) {
-        gatewayProc.kill("SIGKILL");
-      }
-    } catch (err) {
-      log.warn("wrapper", `error killing gateway: ${err.message}`);
-    }
-  }
-
   try {
-    const stopResult = await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
-    log.info("wrapper", `gateway stop during shutdown exit=${stopResult.code}`);
+    await stopGatewayProcess();
   } catch (err) {
-    log.warn("wrapper", `gateway stop during shutdown failed: ${err.message}`);
+    log.warn("wrapper", `error stopping gateway: ${err.message}`);
   }
 
   process.exit(0);
