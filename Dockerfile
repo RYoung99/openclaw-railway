@@ -16,9 +16,9 @@ RUN apt-get update \
 
 RUN npm install -g \
     --allow-scripts=openclaw \
-    openclaw@2026.8.1 \
+    openclaw@2026.8.2 \
   && node --version | grep -Eq '^v26\.' \
-  && openclaw --version | grep -Eq '^OpenClaw 2026\.8\.1( |$)'
+  && openclaw --version | grep -Eq '^OpenClaw 2026\.8\.2( |$)'
 RUN npm install -g clawhub@latest
 
 WORKDIR /app
