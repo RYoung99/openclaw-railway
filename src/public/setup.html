@@ -57,9 +57,8 @@
 
       get authRequiresSecret() {
         return ![
-          'openai-codex-device-code',
+          'openai-device-code',
           'xai-device-code',
-          'google-gemini-cli',
           'github-copilot',
           'ollama',
           'vllm',
@@ -69,7 +68,7 @@
 
       get isDeviceCode() {
         return [
-          'openai-codex-device-code',
+          'openai-device-code',
           'xai-device-code'
         ].includes(this.selectedAuth);
       },
@@ -485,6 +484,7 @@
 <body x-data="setupApp()">
   <div class="container">
     <div class="logo-wrap">
+      <span class="logo-text">OpenClaw 🦞</span>
       <picture>
         <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/openclaw/openclaw/refs/heads/main/docs/assets/openclaw-hero-dark.png">
         <img src="https://raw.githubusercontent.com/openclaw/openclaw/refs/heads/main/docs/assets/openclaw-hero-light.png" alt="OpenClaw" class="logo-img">

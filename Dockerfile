@@ -1,4 +1,4 @@
-FROM node:24-bookworm
+FROM node:26-bookworm
 
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -14,13 +14,18 @@ RUN apt-get update \
     unzip \
   && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g openclaw@2026.7.1
+RUN npm install -g \
+    --allow-scripts=openclaw \
+    openclaw@2026.8.2 \
+  && node --version | grep -Eq '^v26\.' \
+  && openclaw --version | grep -Eq '^OpenClaw 2026\.8\.2( |$)'
 RUN npm install -g clawhub@latest
 
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml ./
-RUN corepack enable && pnpm install --frozen-lockfile --prod
+RUN npm install -g pnpm@11.24.0 \
+  && pnpm install --frozen-lockfile --prod
 
 COPY src ./src
 COPY --chmod=755 entrypoint.sh ./entrypoint.sh
@@ -40,6 +45,7 @@ ENV HOMEBREW_REPOSITORY="/home/linuxbrew/.linuxbrew/Homebrew"
 
 ENV PORT=8080
 ENV OPENCLAW_ENTRY=/usr/local/lib/node_modules/openclaw/dist/entry.js
+ENV OPENCLAW_SUPERVISOR_MODE=external
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
