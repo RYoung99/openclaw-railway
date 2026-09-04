@@ -7,6 +7,6 @@ services:
       - PORT=8080
       - SETUP_PASSWORD=test
       - OPENCLAW_STATE_DIR=/data/.openclaw
-      - OPENCLAW_WORKSPACE_DIR=/data/workspace
+      - OPENCLAW_WORKSPACE_DIR=/data/.openclaw/workspace
     volumes:
       - ./.tmpdata:/data
